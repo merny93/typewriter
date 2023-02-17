@@ -80,7 +80,7 @@ int cleanup(){
     */
    return bcm2835_close();
 }
-int write(int row_n, int col_n, int n_repeat){
+int write(int key_n, int n_repeat){
     /*
     Write to a specific address (designeated by row, col) by pulling it low n_repeat times
     assume init
@@ -94,8 +94,8 @@ int write(int row_n, int col_n, int n_repeat){
         return -1;
     }
 
-    int row=polling_pins[row_n];
-    int col = value_pins[col_n];
+    int row=polling_pins[key_n/VALUE_PINS_NUM];
+    int col = value_pins[key_n%VALUE_PINS_NUM];
 
     int n_timout = 0;
     clock_t start_t;
@@ -144,33 +144,20 @@ int* read(int* res, int timout_ms){
     returns an int** array where res[row][col] == 1 means the button was pressed
     row is polling, col is value
     */
-   setPriority(); //fails anyways
+   setPriority();
 
    clock_t start_t = clock();
    int timeout_clock = timout_ms*CLOCKS_PER_SEC/1000;
 
-   //need to lock on...
-   int polling_pointer = 0;
-    for (int i=0; i<POLLING_PINS_NUM; i++){
-        if (bcm2835_gpio_lev(polling_pins[i]) == LOW){
-            //this is the pin that is being polled currently!
-            polling_pointer = (i+1)%POLLING_PINS_NUM;
-        }
-    }
-   //this will probably lock on...it might also just skip it but it does not really matter
+
+    int polling_pointer = 0;
+    int value_pointer = 0;
     while(clock()- start_t <timeout_clock){
         if (bcm2835_gpio_lev(polling_pins[polling_pointer]) == LOW){
-            //it just got pulled down. wait a bit and then read
-            // for(int i=0;i < 10; i++){
-            //     bcm2835_gpio_lev(value_pins[0]); //dumb wait.. works tho
-            // }
-            bcm2835_delayMicroseconds(50);
-            //loop through all the value pins
-            for (int i=0; i<VALUE_PINS_NUM; i++){
-                res[polling_pointer*VALUE_PINS_NUM+i] += !bcm2835_gpio_lev(value_pins[i]);
-            }
-            //done looping through that row increment the pointer
-            polling_pointer = (polling_pointer+1)%POLLING_PINS_NUM;
+            res[polling_pointer*VALUE_PINS_NUM+value_pointer] += !(bcm2835_gpio_lev(value_pins[value_pointer]) || bcm2835_gpio_lev(polling_pins[polling_pointer])) ;
+            value_pointer = (value_pointer + 1) % VALUE_PINS_NUM;
+        } else {
+            polling_pointer = (polling_pointer + 1) % POLLING_PINS_NUM;
         }
    }
    return res;
