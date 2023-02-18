@@ -1,7 +1,9 @@
 import ctypes
 import time
 import os
+import threading
 import json
+import warnings
 #### to run adjust rtprio in
 ## > sudo nano /etc/security/limits.conf
 # then
@@ -52,13 +54,14 @@ with open("mapping.json") as f:
 mapping_inv = {v: k for k, v in mapping.items()}
 
 class Typewriter(object):
-    def __init__(self, n_repeat = 10, char_wait = 0.05, cr_wait_p_char = 0.3, read_blocks = 20 ):
+    def __init__(self, n_repeat = 8, char_wait = 0.04, cr_wait_p_char = 0.02, read_blocks = 20, double_wait = 0.2 ):
         self.n_repeat = n_repeat
         self.char_wait = char_wait
         self.cr_wait_p_char = cr_wait_p_char
         self.shift_state = False
         self.c_advance = 0
         self.read_blocks = read_blocks
+        self.double_wait = double_wait
         self.commanding_queue = []
         if _lock:
             raise ValueError("can not have two instances")
@@ -68,7 +71,7 @@ class Typewriter(object):
         if init_re == 0:
             raise ValueError("Failed to init the bcm interface")
         elif init_re == -1:
-            raise ValueError("Did not have permision to change priority settings")
+            raise ValueError("Did not have permision to change priority settings, run ulimit -Sr 1")
         global _lock
         _lock = True
         return self
@@ -76,41 +79,80 @@ class Typewriter(object):
         _cleanup()
         global _lock
         _lock = False
-    def gen_command(self, char, default= "?"):
+    def gen_command(self, char, default= "*", shift_char_call =False):
+        def write_func(char):
+            return lambda self = self, char=char: _write(char, self.n_repeat)
+
         if char == "\n":
+            #if carriage return wait longer
             wait = self.c_advance*self.cr_wait_p_char
+            self.c_advance = 0
         else:
+            #regular wait
+            self.c_advance += 1
             wait = self.char_wait
-        wait_func = [lambda wait=wait: time.sleep(wait)]
+
+        wait_func = lambda wait=wait: time.sleep(wait)
+
+        #check if char is in the mapping
         if char in mapping:
+            #check if it's reccursive
             if type(mapping[char]) == int:
-                keys = [lambda self= self, char = char: _write(mapping[char], self.n_repeat),]   
+                #it is not
+                self.commanding_queue.append(write_func(mapping[char]))
                 shift = False
             else:
-                keys = [lambda self= self, char = char: _write(mapping[mapping[char]], self.n_repeat),]    
+                #it is do the recursive thing
+                self.gen_command(mapping[char], shift_char_call=True)
                 shift = True  
         elif char.lower() in mapping:
-            keys = [lambda self= self, char = char: _write(mapping[char.lower()], self.n_repeat),]
+            #is the lowercase version in it?
+            #do recursive thing
+            self.gen_command(char.lower(), shift_char_call=True)
             shift = True
         else:
+            #unknown
+            warning_string = f"Unknown charachter: {char}, replaced with default: {default}"
+            warnings.warn(warning_string)
             self.gen_command(default)
             return
-        if shift and not self.shift_state:
-            keys = [lambda self = self: _write(CAPS, self.n_repeat)] + wait_func + keys
-            self.shift_state = True
-        elif not shift and self.shift_state:
-            keys = [lambda self = self: _write(SHIFT, self.n_repeat)] + wait_func + keys
-            self.shift_state = False
         
-        keys =  keys + wait_func
+        #if its a space ignore shift state
+        if char in [" ", "\n"]:
+            shift = self.shift_state
+        
+        #only do the prepending shift if its a shift call
+        if not shift_char_call:
+            if shift and not self.shift_state:
+                #need to press caps but backup 2 squares cause of the sleep
+                self.commanding_queue.insert(-2, write_func(CAPS))
+                self.commanding_queue.insert(-2, wait_func)
+                self.shift_state = True
+            elif not shift and self.shift_state:
+                #this is a lowercase char so there was no second call so no sleep got appended
+                #backup only 1 square
+                self.commanding_queue.insert(-1, write_func(SHIFT))
+                self.commanding_queue.insert(-1, wait_func)
+                self.shift_state = False
+        #add the sleep
+        self.commanding_queue.append(wait_func)
 
-        self.commanding_queue.extend(keys)
     def type_queue_blocking(self):
         for command in self.commanding_queue:
             command()
         self.commanding_queue = []
     def gen_commands(self, string):
+        """
+        Generate commands for string into the commanding queue. Will press shift at the start just in case
+        """
+        prev = " "
+        self.shift_state = False
+        self.commanding_queue.append(lambda self=self: _write(SHIFT, self.n_repeat))
+        self.commanding_queue.append(lambda self = self: time.sleep(self.char_wait))
         for s in string:
+            if s == prev:
+                self.commanding_queue.append(lambda self=self: time.sleep(self.double_wait))
+            prev = s  
             self.gen_command(s)
     
     def read_blocking(self, time_to_read):
@@ -131,14 +173,18 @@ class Typewriter(object):
             if prev_keys == keys:
                 continue #nothing changed
             prev_keys= keys
-            if len(keys) != 1:
-                #zero or many keys
-                #dunno ignore
+            if len(keys) == 0:
+                #Nothing pressed
+                continue
+            elif len(keys) >1:
+                warning_string = "multiple keys pressed at once. ignoring"
+                warnings.warn(warning_string)
                 continue
             #only one so get it
             key = int(next(iter(keys)))
             if not key in mapping_inv:
-                #unknown key
+                warning_string = f"Recieved unknown input key: {key}"
+                warnings.warn(warning_string)
                 continue
             key_map = mapping_inv[key]
             if shift:
@@ -157,6 +203,6 @@ class Typewriter(object):
 
 if __name__ == "__main__":
     with Typewriter() as tw:
-        tw.gen_commands("Hi\nI am!")
+        tw.gen_commands("Cock & Balls!")
         tw.type_queue_blocking()
-        # print(tw.read_blocking(10))
+        # print(tw.read_blocking(5))
