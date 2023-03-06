@@ -203,6 +203,6 @@ class Typewriter(object):
 
 if __name__ == "__main__":
     with Typewriter() as tw:
-        tw.gen_commands("Cock & Balls!")
+        tw.gen_commands("Hello my friend!")
         tw.type_queue_blocking()
         # print(tw.read_blocking(5))
