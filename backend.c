@@ -15,6 +15,21 @@
 
 #define POLLING_PINS_NUM 9
 #define VALUE_PINS_NUM 8
+#define READ_DEBOUNCE 10
+
+
+#define msgcheck(msg)         \
+    if (msg == -1)            \
+    {                         \
+         \
+    }                                   \
+
+typedef struct
+{
+   long data_type;
+   int data_buff[1];
+} t_data;
+
 
 //the polling_pins in order
 int polling_pins[POLLING_PINS_NUM] = {
@@ -39,6 +54,8 @@ int value_pins[VALUE_PINS_NUM] = {
     RPI_V2_GPIO_P1_07, 
     RPI_V2_GPIO_P1_18,  
 };
+
+
 
 int setPriority(){
     const struct sched_param priority = {1};
@@ -85,44 +102,48 @@ int cleanup_tw(){
     */
    return bcm2835_close();
 }
-int write_tw(int key_n, int n_repeat){
+
+
+int write_multiple_tw(int* keys, int key_n, int pulse_n){
     /*
-    Write to a specific address (designeated by row, col) by pulling it low n_repeat times
-    assume init
-    row is polling, col is value
-    1 if successful else 0
-    if it times out it will return failure
+    works in exactly the same way as write 
     */
-   
+      
     //set priority for fast!
     if (setPriority() == -1){
         return -1;
     }
 
-    int row=polling_pins[key_n/VALUE_PINS_NUM];
-    int col = value_pins[key_n%VALUE_PINS_NUM];
-
     int n_timout = 0;
     clock_t start_t;
 
-    //write low on the correct value_pin (column) when the correct row is depresed
-    for (int num_pulses =0; num_pulses<n_repeat; num_pulses++){
-        start_t =clock();
-        while(bcm2835_gpio_lev(row) == HIGH){
+    for (int pulse_num = 0; pulse_num < key_n*pulse_n; pulse_num++){
+        int waiting = 1;
+        int i;
+        while (waiting){
+            for (i = 0; i < key_n; i++){
+                if (bcm2835_gpio_lev(polling_pins[keys[i]/VALUE_PINS_NUM]) == LOW){
+                    waiting = 0;
+                    break;
+                }
+
+            }
             if ((clock() - start_t) > TIMEOUT_POLLING_HIGH_CLOCK){
                 n_timout++;
                 break;
             }
-            //wait for it to go low
         }
-        //must have gone low!
-        //update to write
-        bcm2835_gpio_fsel(col, BCM2835_GPIO_FSEL_OUTP);
-        //write low
-        bcm2835_gpio_write(col, LOW);
-        //wait for it to finish polling
+        // i must have gone low
+        for (int j = 0; j<key_n; j++){
+            if (polling_pins[keys[i]/VALUE_PINS_NUM] == polling_pins[keys[j]/VALUE_PINS_NUM]){
+                bcm2835_gpio_fsel(value_pins[keys[j]%VALUE_PINS_NUM], BCM2835_GPIO_FSEL_OUTP);
+                //write low
+                bcm2835_gpio_write(value_pins[keys[j]%VALUE_PINS_NUM], LOW);
+            }
+        }
+        //now wait until its back
         start_t =clock();
-        while(bcm2835_gpio_lev(row) == LOW){
+        while(bcm2835_gpio_lev(polling_pins[keys[i]/VALUE_PINS_NUM]) == LOW){
             if ((clock() - start_t)  > TIMEOUT_POLLING_LOW_CLOCK){
                 n_timout++;
                 break;
@@ -130,10 +151,21 @@ int write_tw(int key_n, int n_repeat){
             //wait again for it to go high
         }
         //must have gone high
-        //switch back to high-impedance input
+        for (int j = 0; j<key_n; j++){
+            if (polling_pins[keys[i]/VALUE_PINS_NUM] == polling_pins[keys[j]/VALUE_PINS_NUM]){
+                bcm2835_gpio_fsel(value_pins[keys[j]%VALUE_PINS_NUM], BCM2835_GPIO_FSEL_INPT);
+                bcm2835_gpio_set_pud(value_pins[keys[j]%VALUE_PINS_NUM],BCM2835_GPIO_PUD_OFF);
+            }
+        }
+
+    }
+    //done loop set everything to high impedance
+    for(int i = 0; i < key_n; i++){
+        int col = value_pins[keys[i]%VALUE_PINS_NUM];
         bcm2835_gpio_fsel(col, BCM2835_GPIO_FSEL_INPT);
         bcm2835_gpio_set_pud(col,BCM2835_GPIO_PUD_OFF);
     }
+    
     //all done
     if (n_timout > 0){
         return 0;
@@ -142,43 +174,7 @@ int write_tw(int key_n, int n_repeat){
     }
 }
 
-int* read_tw(int* res, int timout_ms){
-    /*
-    return the next entered key. or timeout... assume init
-    check that the key was pressed repeat times
-    returns an int** array where res[row][col] == 1 means the button was pressed
-    row is polling, col is value
-    */
-   setPriority();
 
-   clock_t start_t = clock();
-   int timeout_clock = timout_ms*CLOCKS_PER_SEC/1000;
-
-
-    int polling_pointer = 0;
-    int value_pointer = 0;
-    while(clock()- start_t <timeout_clock){
-        if (bcm2835_gpio_lev(polling_pins[polling_pointer]) == LOW){
-            res[polling_pointer*VALUE_PINS_NUM+value_pointer] += !(bcm2835_gpio_lev(value_pins[value_pointer]) || bcm2835_gpio_lev(polling_pins[polling_pointer])) ;
-            value_pointer = (value_pointer + 1) % VALUE_PINS_NUM;
-        } else {
-            polling_pointer = (polling_pointer + 1) % POLLING_PINS_NUM;
-        }
-   }
-   return res;
-}
-
-#define msgcheck(msg)         \
-    if (msg == -1)            \
-    {                         \
-         \
-    }                                   \
-
-typedef struct
-{
-   long data_type;
-   int data_buff[1];
-} t_data;
 
 void read_stream_tw(int *alive)
 {
@@ -212,21 +208,27 @@ void read_stream_tw(int *alive)
         if ((polling_pointer != ignore_pointer) && (bcm2835_gpio_lev(polling_pins[polling_pointer]) == LOW))
         {
                 for (int value_pointer = 0; value_pointer < VALUE_PINS_NUM; value_pointer++){
-                if (bcm2835_gpio_lev(value_pins[value_pointer]) == LOW)
-                {
-                    res = polling_pointer * VALUE_PINS_NUM + value_pointer;
-                    memcpy(data.data_buff, &res, sizeof(int));
-                    // printf("sending %d\n", res);
-                    msgcheck(msgsnd( msqid, &data, sizeof( t_data) - sizeof( long), IPC_NOWAIT));
-                    // printf("sent %d\n", res);
-                }
+                    int i;
+                    for (i=1; i<=READ_DEBOUNCE + 1; i++){
+                        if (bcm2835_gpio_lev(polling_pins[polling_pointer]) || bcm2835_gpio_lev(value_pins[value_pointer])){
+                            break;
+                        }
+                    }
+                    if (i > READ_DEBOUNCE)
+                    {
+                        res = polling_pointer * VALUE_PINS_NUM + value_pointer;
+                        memcpy(data.data_buff, &res, sizeof(int));
+                        // printf("sending %d\n", res);
+                        msgcheck(msgsnd( msqid, &data, sizeof( t_data) - sizeof( long), IPC_NOWAIT));
+                        // printf("sent %d\n", res);
+                    }
                 }
                 ignore_pointer = polling_pointer;
                 
         }
         else
         {
-            polling_pointer = (polling_pointer + 1) % POLLING_PINS_NUM;  
+            polling_pointer = ((polling_pointer - 1) + POLLING_PINS_NUM) % POLLING_PINS_NUM;  
         }
    }
    printf("exiting read_stream_tw\n");
