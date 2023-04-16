@@ -4,6 +4,11 @@
 #include <bcm2835.h>
 #include <stdio.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <unistd.h>
+#include <string.h>
 
 #define TIMEOUT_POLLING_LOW_CLOCK 2*CLOCKS_PER_SEC/1000
 #define TIMEOUT_POLLING_HIGH_CLOCK 20*CLOCKS_PER_SEC/1000
@@ -40,7 +45,7 @@ int setPriority(){
     return sched_setscheduler(0, SCHED_FIFO, &priority);
 }
 
-extern int init(){
+extern int init_tw(){
     /*
     Initalizes all the pins as high impeedance inputs.
     1 if successful else 0 or -1 if fails the priority check
@@ -73,14 +78,14 @@ extern int init(){
     
 }
 
-int cleanup(){
+int cleanup_tw(){
     /*
     Release all inputs and detach library
     1 if successful else 0
     */
    return bcm2835_close();
 }
-int write(int key_n, int n_repeat){
+int write_tw(int key_n, int n_repeat){
     /*
     Write to a specific address (designeated by row, col) by pulling it low n_repeat times
     assume init
@@ -137,7 +142,7 @@ int write(int key_n, int n_repeat){
     }
 }
 
-int* read(int* res, int timout_ms){
+int* read_tw(int* res, int timout_ms){
     /*
     return the next entered key. or timeout... assume init
     check that the key was pressed repeat times
@@ -163,3 +168,69 @@ int* read(int* res, int timout_ms){
    return res;
 }
 
+#define msgcheck(msg)         \
+    if (msg == -1)            \
+    {                         \
+         \
+    }                                   \
+
+typedef struct
+{
+   long data_type;
+   int data_buff[1];
+} t_data;
+
+void read_stream_tw(int *alive)
+{
+   /*
+  writes to a message queue the next entered key.
+  goes untill alive is set to 0
+    */
+
+   printf("starting read_stream_tw at the start\n");
+   setPriority();
+
+   int msqid;
+   t_data data;
+   int res;
+
+   // create message queue
+    if (-1 == (msqid = msgget( (key_t)1234, IPC_CREAT | 0666))){
+        perror("msgget failed");
+        exit(1);
+    }
+
+   
+
+    int polling_pointer = 0;
+    int ignore_pointer = 0;
+   printf("starting read_stream_tw\n");
+
+   
+   while (alive[0])
+   {
+        if ((polling_pointer != ignore_pointer) && (bcm2835_gpio_lev(polling_pins[polling_pointer]) == LOW))
+        {
+                for (int value_pointer = 0; value_pointer < VALUE_PINS_NUM; value_pointer++){
+                if (bcm2835_gpio_lev(value_pins[value_pointer]) == LOW)
+                {
+                    res = polling_pointer * VALUE_PINS_NUM + value_pointer;
+                    memcpy(data.data_buff, &res, sizeof(int));
+                    // printf("sending %d\n", res);
+                    msgcheck(msgsnd( msqid, &data, sizeof( t_data) - sizeof( long), IPC_NOWAIT));
+                    // printf("sent %d\n", res);
+                }
+                }
+                ignore_pointer = polling_pointer;
+                
+        }
+        else
+        {
+            polling_pointer = (polling_pointer + 1) % POLLING_PINS_NUM;  
+        }
+   }
+   printf("exiting read_stream_tw\n");
+   // destroy message queue
+   msgctl(msqid, IPC_RMID, NULL);
+   return;
+}

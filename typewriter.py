@@ -4,6 +4,8 @@ import os
 import threading
 import json
 import warnings
+import sysv_ipc
+from queue import Queue, Full, Empty
 #### to run adjust rtprio in
 ## > sudo nano /etc/security/limits.conf
 # then
@@ -18,34 +20,110 @@ _lib = ctypes.CDLL("./libtypewriter.so", mode=1)
 
 _lock = False
 ##start with init
-_lib.init.argtypes = tuple()
-_lib.init.restype = ctypes.c_int
+_lib.init_tw.argtypes = tuple()
+_lib.init_tw.restype = ctypes.c_int
 def _init():
     global _lib
-    return int(_lib.init())
+    return int(_lib.init_tw())
 
 ## now cleanup
-_lib.cleanup.argtypes = tuple()
-_lib.cleanup.restype = ctypes.c_int
+_lib.cleanup_tw.argtypes = tuple()
+_lib.cleanup_tw.restype = ctypes.c_int
 def _cleanup():
     global _lib
-    return int(_lib.cleanup())
+    return int(_lib.cleanup_tw())
 
 ## now write
-_lib.write.argtypes = (ctypes.c_int,ctypes.c_int)
-_lib.write.restype = ctypes.c_int
+_lib.write_tw.argtypes = (ctypes.c_int,ctypes.c_int)
+_lib.write_tw.restype = ctypes.c_int
 def _write(key, repeat_n):
     global _lib
-    return int(_lib.write( ctypes.c_int(key),ctypes.c_int(repeat_n)))
+    return int(_lib.write_tw( ctypes.c_int(key),ctypes.c_int(repeat_n)))
 
-_lib.read.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_int)
-_lib.read.restype = ctypes.POINTER(ctypes.c_int*(8*9))
+## now read
+_lib.read_tw.argtypes = (ctypes.POINTER(ctypes.c_int), ctypes.c_int)
+_lib.read_tw.restype = ctypes.POINTER(ctypes.c_int*(8*9))
 def _read(timeout_ms):
     global _lib
     res_type = ctypes.c_int*(8*9)
     res_mem = res_type(*[0 for _ in range(8*9)])
-    result = _lib.read(res_mem, ctypes.c_int(timeout_ms))
+    result = _lib.read_tw(res_mem, ctypes.c_int(timeout_ms))
     return [i for i in result.contents]
+
+## streaming read
+_lib.read_stream_tw.argtypes = (ctypes.POINTER(ctypes.c_int),)
+def _read_stream(alive_array):
+    global _lib
+    _lib.read_stream_tw(alive_array)
+    return 
+
+class ReadStream(object):
+    def __init__(self):
+
+        self.mq = sysv_ipc.MessageQueue(1234, sysv_ipc.IPC_CREAT) 
+        self._empty()
+        
+        self.alive = ctypes.POINTER(ctypes.c_int)(ctypes.c_int(1))
+        self.c_thread = threading.Thread(target=_read_stream, daemon=True, args=(self.alive,))
+           
+          
+        self.queue = Queue(100)
+        self.read_thread = threading.Thread(target=self._get, daemon=True)
+        
+    def get(self, max_size = 100):
+        res = []
+        while True:
+            try:
+                res.append(self.queue.get(block=False))
+                if len(res ) >= max_size:
+                    break
+            except Empty:
+                break
+        return res
+    def __enter__(self):
+        self.c_thread.start() 
+        self.read_thread.start()
+        return self
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.cleanup()
+    def _get_next(self):
+        try:
+            message, mtype = self.mq.receive(block=False)
+            res = int.from_bytes(message, byteorder='little')
+            try:
+                self.queue.put((res, time.time()), block=False,)
+            except Full:
+                pass
+            # print(f"Interpret as numpy: {numpy_message}")
+        except sysv_ipc.BusyError:
+            return
+        except sysv_ipc.ExistentialError:
+            return
+    def _empty(self):
+        while True:
+            try:
+                _ = self.mq.receive(block=False)
+            except sysv_ipc.BusyError:
+                return        
+    def _get(self):
+        while self.alive.contents.value:
+            self._get_next()
+    def cleanup(self):
+        print("quitting")
+        self.alive.contents.value = 0
+        # time.sleep(0.5)
+        self.c_thread.join()
+        self.read_thread.join()
+        
+        
+        
+        try:
+            self.mq.remove()
+        except sysv_ipc.ExistentialError:
+            print("message queue already removed")
+            pass
+
+
 
 
 with open("mapping.json") as f:
@@ -54,7 +132,7 @@ with open("mapping.json") as f:
 mapping_inv = {v: k for k, v in mapping.items()}
 
 class Typewriter(object):
-    def __init__(self, n_repeat = 8, char_wait = 0.04, cr_wait_p_char = 0.02, read_blocks = 20, double_wait = 0.2 ):
+    def __init__(self, n_repeat = 8, char_wait = 0.04, cr_wait_p_char = 0.02, read_blocks = 10, double_wait = 0.2 ):
         self.n_repeat = n_repeat
         self.char_wait = char_wait
         self.cr_wait_p_char = cr_wait_p_char
@@ -136,6 +214,12 @@ class Typewriter(object):
                 self.shift_state = False
         #add the sleep
         self.commanding_queue.append(wait_func)
+    
+    def write(self, message):
+        
+        self.gen_commands(message)
+        self.type_queue_blocking()
+
 
     def type_queue_blocking(self):
         for command in self.commanding_queue:
@@ -145,6 +229,8 @@ class Typewriter(object):
         """
         Generate commands for string into the commanding queue. Will press shift at the start just in case
         """
+        MAX_LINE_LENGTH_SOFT = 60 # characters
+        MAX_LINE_WIDTH_HARD = 70 # characters
         prev = " "
         self.shift_state = False
         self.commanding_queue.append(lambda self=self: _write(SHIFT, self.n_repeat))
@@ -154,13 +240,21 @@ class Typewriter(object):
                 self.commanding_queue.append(lambda self=self: time.sleep(self.double_wait))
             prev = s  
             self.gen_command(s)
+            if self.c_advance > MAX_LINE_LENGTH_SOFT and s == " ":
+                self.gen_command("\n")
+            elif self.c_advance > MAX_LINE_WIDTH_HARD:
+                self.gen_command("-")
+                self.gen_command("\n")
+        self.commanding_queue.append(lambda self=self: _write(SHIFT, self.n_repeat))
     
     def read_blocking(self, time_to_read):
         starting_time = time.time()
         prev_keys = set()
         string_queue = []
+        
+        #loop for required duration and append to list
         while (time.time()- starting_time < time_to_read):
-            res = _read(self.read_blocks)
+            res = _read(self.read_blocks)            
             keys = set()
             for char_key, repepat in enumerate(res):
                 if repepat > 0:
@@ -194,7 +288,7 @@ class Typewriter(object):
                     key_map = key_map.upper()
             
             string_queue.append(key_map)
-            
+
 
         return "".join(string_queue)
 
@@ -203,6 +297,9 @@ class Typewriter(object):
 
 if __name__ == "__main__":
     with Typewriter() as tw:
-        tw.gen_commands("Cock & Balls!")
-        tw.type_queue_blocking()
-        # print(tw.read_blocking(5))
+        # _read_stream(ctypes.POINTER(ctypes.c_int)(ctypes.c_int(0)))
+        # rs = ReadStream()
+        with ReadStream() as rs:
+            for _ in range(10):
+                print(rs.get())
+                time.sleep(0.1)
